@@ -1,0 +1,73 @@
+name: build-binaries
+
+on:
+  push:
+    tags:
+      - "v*"          # e.g. v0.1.0
+  workflow_dispatch:  # also let you trigger manually from the Actions tab
+
+jobs:
+  build:
+    name: build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: manta-macos
+            ext: ""
+          - os: windows-latest
+            asset: manta-windows
+            ext: ".exe"
+          - os: ubuntu-latest
+            asset: manta-linux
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: build
+        run: pyinstaller manta.spec
+
+      - name: rename for upload
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          cp "dist/manta${{ matrix.ext }}" "artifacts/${{ matrix.asset }}${{ matrix.ext }}"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: artifacts/*
+
+  release:
+    name: attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./all-binaries
+          merge-multiple: true
+
+      - name: create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ./all-binaries/*
+          generate_release_notes: true
