@@ -71,7 +71,6 @@ def streamed_say(prefix: str, gen) -> str:
 # ---------- onboarding ----------
 
 def onboard() -> dict:
-    console.print(BANNER, style="bold magenta")
     console.print("hey! i'm Manta. before we start, two quick things.\n", style="italic")
     name = Prompt.ask("[bold]what should i call you[/bold]").strip() or "friend"
     nick = Prompt.ask(
@@ -278,7 +277,6 @@ def _validate_key(provider: str, key: str) -> tuple[bool, str]:
 
 def run_key_wizard() -> None:
     console.print()
-    console.print(BANNER, style="bold magenta")
     console.print(Panel(
         "hey, before we talk — i need a free API key to think.\n"
         "pick ONE (or both, more is better):\n\n"
@@ -329,6 +327,7 @@ def run_key_wizard() -> None:
 
 def main() -> None:
     db.init()
+    console.print(BANNER, style="bold magenta")
 
     if not llm.have_provider():
         run_key_wizard()
