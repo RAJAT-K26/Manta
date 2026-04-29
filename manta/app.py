@@ -15,7 +15,7 @@ from rich.prompt import Prompt
 from rich.rule import Rule
 from rich.text import Text
 
-from .core import config, db, diagnostic, garden, lesson, llm, memory, streak, syllabus
+from .core import config, db, diagnostic, garden, knowledge, lesson, llm, memory, streak, syllabus
 
 console = Console()
 
@@ -129,11 +129,6 @@ def build_course(user: dict, topic: str, level: str) -> dict:
 
 # ---------- lesson chat ----------
 
-LESSON_HELP = (
-    "[dim]commands: /quiz to take the mastery check · /map to see your path · "
-    "/end to wrap up the session[/dim]"
-)
-
 
 def kick_off_message(user: dict, course: dict, node: dict, fresh: bool) -> str:
     """Have Manta open the session naturally, with a callback if possible."""
@@ -160,19 +155,46 @@ def kick_off_message(user: dict, course: dict, node: dict, fresh: bool) -> str:
 def run_quiz(user: dict, course: dict, node: dict, session_id: int) -> bool:
     console.print()
     hr("mastery check")
-    qs = lesson.make_quiz(course["topic"], node["title"])
+    db.set_session_phase(session_id, "assess")
+
+    concepts = lesson._node_concepts(node)
+    qs = lesson.make_quiz(course["topic"], node["title"], concepts or None)
     scores: list[int] = []
+
     for i, q in enumerate(qs, 1):
         console.print(f"\n[bold cyan]Q{i} ({q.get('kind','')}):[/bold cyan] {q['q']}")
+        t0 = time.time()
         ans = Prompt.ask("[bold]you[/bold]")
+        latency_ms = int((time.time() - t0) * 1000)
+
+        # confidence prompt
+        conf_raw = Prompt.ask(
+            "[dim]how sure were you? (1=guessed  2=unsure  3=certain)[/dim]",
+            choices=["1", "2", "3"], default="2",
+        )
+        confidence = int(conf_raw)
+
         result = lesson.grade_answer(course["topic"], node["title"], q, ans)
         scores.append(result["score"])
         fb = result.get("feedback") or ""
         color = "green" if result["score"] >= 2 else "yellow"
         console.print(f"[{color}]Manta: {fb}[/{color}]")
-        # log into the session too
-        db.add_message(session_id, "user", f"[quiz Q{i}] {ans}")
+
+        db.add_message(session_id, "user", f"[quiz Q{i}] {ans}",
+                       response_time_ms=latency_ms)
         db.add_message(session_id, "assistant", f"[quiz feedback Q{i}] {fb}")
+
+        # Record per-concept state
+        concept_name = result.get("concept") or (concepts[0] if concepts else node["title"])
+        knowledge.record_quiz_answer(
+            user_id=user["id"],
+            node_id=node["id"],
+            concept=concept_name,
+            correct=(result["score"] >= 2),
+            confidence=confidence,
+            latency_ms=latency_ms,
+            confusion_type=result.get("confusion_type", "none"),
+        )
 
     avg = sum(scores) / len(scores) if scores else 0
     mastered = lesson.is_mastered(scores)
@@ -180,10 +202,12 @@ def run_quiz(user: dict, course: dict, node: dict, session_id: int) -> bool:
     console.print(
         f"score: [bold]{avg:.1f}/3[/bold]   "
         + ("[bold green]passed ✓[/bold green]" if mastered
-           else "[bold yellow]not yet — let's revisit[/bold yellow]")
+           else "[bold yellow]not yet — keep going[/bold yellow]")
     )
     if mastered:
         db.set_node_status(node["id"], "mastered", score=avg)
+        # Auto-insert review node for weak concepts before unlocking next
+        knowledge.maybe_insert_review_node(user["id"], course["id"], node["id"])
         nxt = db.unlock_next(course["id"], node["id"])
         if nxt:
             console.print(f"[green]next unlocked:[/green] {nxt['title']}")
@@ -192,6 +216,43 @@ def run_quiz(user: dict, course: dict, node: dict, session_id: int) -> bool:
     else:
         db.set_node_status(node["id"], "in_progress", score=avg)
     return mastered
+
+
+def run_teach_back(user: dict, course: dict, node: dict, session_id: int) -> None:
+    """Challenge mode: student explains a concept back to Manta."""
+    console.print()
+    hr("teach it back")
+    db.set_session_phase(session_id, "challenge")
+    concepts = lesson._node_concepts(node)
+    concept = concepts[0] if concepts else node["title"]
+    console.print(
+        f"[italic]okay — explain [bold]{concept}[/bold] to me. "
+        "pretend I've never heard of it. go.[/italic]"
+    )
+    t0 = time.time()
+    explanation = Prompt.ask("[bold]you[/bold]")
+    latency_ms = int((time.time() - t0) * 1000)
+    result = lesson.grade_teach_back(course["topic"], concept, explanation)
+    score = result["score"]
+    color = "green" if score >= 2 else "yellow"
+    console.print(f"[{color}]Manta: {result['feedback']}[/{color}]")
+    if result.get("misconception"):
+        console.print(f"[dim]correction: {result['misconception']}[/dim]")
+    # Persist
+    db.add_message(session_id, "user", f"[teach-back] {explanation}",
+                   response_time_ms=latency_ms)
+    db.add_message(session_id, "assistant",
+                   f"[teach-back feedback] {result['feedback']}")
+    knowledge.record_quiz_answer(
+        user_id=user["id"], node_id=node["id"], concept=concept,
+        correct=(score >= 2), confidence=min(3, score + 1),
+        latency_ms=latency_ms, confusion_type="none",
+    )
+
+
+LESSON_HELP = (
+    "[dim]commands: /quiz · /teach · /map · /end[/dim]"
+)
 
 
 def lesson_chat(user: dict, course: dict) -> None:
@@ -203,17 +264,34 @@ def lesson_chat(user: dict, course: dict) -> None:
     fresh = node.get("status") != "in_progress"
     db.set_node_status(node["id"], "in_progress")
 
+    # snapshot concept state before session starts (for quality scoring)
+    concept_states_before = db.concept_states_for_node(user["id"], node["id"])
+
+    # compute resume context once per session
+    resume_ctx = knowledge.build_resume_context(user["id"], course["id"])
+    # update preferred_style from inferred style
+    if resume_ctx["style"] != user.get("preferred_style", "balanced"):
+        db.update_user(user["id"], preferred_style=resume_ctx["style"])
+        user["preferred_style"] = resume_ctx["style"]
+
     session_id = db.start_session(course["id"], node["id"])
+    db.set_session_phase(session_id, "warm_start")
+
     console.print()
     console.print(header_panel(user, course))
     console.print(LESSON_HELP)
-    hr(f"lesson · {node['title']}")
+    hr(f"{'review' if node.get('node_type') == 'review' else 'lesson'} · {node['title']}")
 
     # Manta opens
     opening = kick_off_message(user, course, node, fresh=fresh)
     db.add_message(session_id, "assistant", opening)
     console.print(Text("Manta: ", style="bold magenta") + Text(opening))
     console.print()
+    db.set_session_phase(session_id, "teach")
+
+    last_assistant_ts = time.time()
+    # how many times has this node been visited before? (for reteach escalation)
+    prior_encounters = len(db.concept_states_for_node(user["id"], node["id"]))
 
     while True:
         try:
@@ -223,6 +301,9 @@ def lesson_chat(user: dict, course: dict) -> None:
 
         if not msg:
             continue
+
+        response_time_ms = int((time.time() - last_assistant_ts) * 1000)
+
         if msg.lower() == "/end":
             break
         if msg.lower() == "/map":
@@ -230,26 +311,42 @@ def lesson_chat(user: dict, course: dict) -> None:
             continue
         if msg.lower() == "/quiz":
             passed = run_quiz(user, course, node, session_id)
+            db.set_session_phase(session_id, "teach")
             if passed:
                 break
             else:
-                # re-teach with a new analogy
                 node = db.current_node(course["id"]) or node
                 continue
+        if msg.lower() == "/teach":
+            run_teach_back(user, course, node, session_id)
+            db.set_session_phase(session_id, "teach")
+            continue
 
         # normal turn
         gen = lesson.reply_stream(
             user=user, course=course, node=node,
             session_id=session_id, user_message=msg,
+            response_time_ms=response_time_ms,
+            prior_encounter_count=prior_encounters,
+            resume_context=resume_ctx if fresh else None,
         )
         streamed_say("Manta: ", gen)
+        last_assistant_ts = time.time()
+        # only inject resume context on first turn
+        fresh = False
 
     # session wrap
+    db.set_session_phase(session_id, "recap")
     console.print()
     hr("wrapping up")
     summary = lesson.write_recap_and_memory(
         user_id=user["id"], course=course, node=node, session_id=session_id,
+        concept_states_before=concept_states_before,
     )
+
+    # end-of-session improvement report
+    _print_session_report(user, node, concept_states_before)
+
     if summary:
         console.print(Panel(summary, title="today's recap", border_style="cyan"))
 
@@ -260,6 +357,31 @@ def lesson_chat(user: dict, course: dict) -> None:
 
     console.print(header_panel(user, course))
     console.print("[italic]see you tomorrow.[/italic]")
+
+
+def _print_session_report(user: dict, node: dict, states_before: list[dict]) -> None:
+    """Print a brief improvement report comparing concept states."""
+    node_id = node["id"]
+    states_after = db.concept_states_for_node(user["id"], node_id)
+    if not states_after:
+        return
+    before_map = {s["concept"]: s["mastery_score"] for s in states_before}
+    improved, still_weak = [], []
+    for s in states_after:
+        c, m = s["concept"], s["mastery_score"]
+        delta = m - before_map.get(c, 0.0)
+        if delta > 0.05 and m >= 0.5:
+            improved.append(c)
+        elif m < 0.5:
+            still_weak.append(c)
+    lines = []
+    if improved:
+        lines.append("[green]improved:[/green] " + ", ".join(improved))
+    if still_weak:
+        lines.append("[yellow]still shaky:[/yellow] " + ", ".join(still_weak))
+    if lines:
+        console.print(Panel("\n".join(lines), title="concept progress",
+                            border_style="dim"))
 
 
 # ---------- key wizard ----------

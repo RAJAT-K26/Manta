@@ -12,25 +12,31 @@ You are designing a personal learning syllabus for a single student.
 Topic: {topic}
 Student level: {level}
 
-Return ONLY a JSON object with this shape:
+Return ONLY a JSON object with this exact shape (no extra keys):
 {{
   "modules": [
     {{
       "title": "Module name",
-      "topics": ["subtopic 1", "subtopic 2", ...]
+      "topics": [
+        {{
+          "title": "Subtopic name",
+          "concepts": ["concept 1", "concept 2", ...]
+        }},
+        ...
+      ]
     }},
     ...
   ]
 }}
 
 Rules:
-- 5 to 8 modules total. Order them so each builds on the last.
-- 3 to 6 subtopics per module. Each subtopic should be a single concept that
-  fits in one short lesson.
+- 5 to 8 modules. Each module builds on the previous.
+- 3 to 6 subtopics per module. Each subtopic fits in one short lesson.
+- Each subtopic has 2-4 "concepts": atomic facts/skills the student must master.
 - Adapt depth to the student's level. Skip what they likely already know.
-- The very first subtopic must be the easiest possible warm-up.
-- The final module must include a small project or capstone.
-- Use plain words, not jargon, in titles.
+- First subtopic = easiest warm-up possible.
+- Final module = small project or capstone.
+- Plain words in all titles. No jargon.
 """
 
 
@@ -49,13 +55,21 @@ def generate(topic: str, level: str) -> dict:
         return _fallback(topic)
     if "modules" not in data or not isinstance(data["modules"], list):
         return _fallback(topic)
-    # sanity-clean
+    # sanity-clean; accept both old string format and new dict format
     cleaned = []
     for mod in data["modules"]:
         if not isinstance(mod, dict):
             continue
         title = str(mod.get("title", "Untitled"))
-        topics = [str(t) for t in mod.get("topics", []) if t]
+        raw_topics = mod.get("topics", [])
+        topics = []
+        for t in raw_topics:
+            if isinstance(t, dict):
+                sub_title = str(t.get("title", "Untitled"))
+                concepts = [str(c) for c in t.get("concepts", []) if c]
+                topics.append({"title": sub_title, "concepts": concepts})
+            elif t:
+                topics.append({"title": str(t), "concepts": []})
         if topics:
             cleaned.append({"title": title, "topics": topics})
     if not cleaned:
@@ -66,11 +80,16 @@ def generate(topic: str, level: str) -> dict:
 def _fallback(topic: str) -> dict:
     return {
         "modules": [
-            {"title": f"Getting started with {topic}",
-             "topics": ["What it is", "Why people learn it", "Your first tiny win"]},
-            {"title": "Core ideas",
-             "topics": ["Idea 1", "Idea 2", "Idea 3"]},
-            {"title": "Putting it together",
-             "topics": ["Mini project"]},
+            {"title": f"Getting started with {topic}", "topics": [
+                {"title": "What it is", "concepts": [f"definition of {topic}", "why it matters"]},
+                {"title": "Your first tiny win", "concepts": ["basic usage", "hello world"]},
+            ]},
+            {"title": "Core ideas", "topics": [
+                {"title": "Idea 1", "concepts": ["core concept 1"]},
+                {"title": "Idea 2", "concepts": ["core concept 2"]},
+            ]},
+            {"title": "Putting it together", "topics": [
+                {"title": "Mini project", "concepts": ["apply everything"]},
+            ]},
         ]
     }
